@@ -2,7 +2,9 @@ package httpx
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/projectdiscovery/retryablehttp-go"
 	"github.com/stretchr/testify/require"
@@ -21,11 +23,19 @@ func TestDo(t *testing.T) {
 	})
 
 	t.Run("content-length with binary body", func(t *testing.T) {
-		req, err := retryablehttp.NewRequest(http.MethodGet, "https://www.w3schools.com/images/favicon.ico", nil)
+		body := []byte{0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x00, 0x01, 0x00, 0x01, 0x80, 0x00, 0x00, 0xff}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "image/gif")
+			_, _ = w.Write(body)
+		}))
+		defer srv.Close()
+
+		req, err := retryablehttp.NewRequest(http.MethodGet, srv.URL, nil)
 		require.Nil(t, err)
 		resp, err := ht.Do(req, UnsafeOptions{})
 		require.Nil(t, err)
-		require.Greater(t, len(resp.Raw), 800)
+		require.Equal(t, len(body), resp.ContentLength)
+		require.Equal(t, body, resp.RawData)
 	})
 }
 
@@ -119,4 +129,61 @@ func TestDefaultProtocolKeepsRetryableHTTP2FallbackClient(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ht.client)
 	require.NotSame(t, ht.client.HTTPClient, ht.client.HTTPClient2)
+}
+
+type blockingReadCloser struct{}
+
+func (*blockingReadCloser) Read([]byte) (int, error) {
+	select {}
+}
+
+func (*blockingReadCloser) Close() error {
+	return nil
+}
+
+type switchingProtocolsRoundTripper struct{}
+
+func (switchingProtocolsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     "101 Switching Protocols",
+		StatusCode: http.StatusSwitchingProtocols,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Upgrade":    {"websocket"},
+			"Connection": {"Upgrade"},
+		},
+		Body:    &blockingReadCloser{},
+		Request: req,
+	}, nil
+}
+
+func TestDoSwitchingProtocolsDoesNotHang(t *testing.T) {
+	options := DefaultOptions
+	options.CdnCheck = "false"
+	options.Timeout = 2 * time.Second
+	options.RetryMax = 0
+
+	ht, err := New(&options)
+	require.NoError(t, err)
+
+	rt := switchingProtocolsRoundTripper{}
+	ht.client.HTTPClient.Transport = rt
+	ht.client.HTTPClient2.Transport = rt
+
+	req, err := retryablehttp.NewRequest(http.MethodGet, "http://example.com", nil)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = ht.Do(req, UnsafeOptions{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("Do hung on 101 Switching Protocols response")
+	}
 }

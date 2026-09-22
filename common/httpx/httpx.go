@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -17,7 +18,9 @@ import (
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/projectdiscovery/cdncheck"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
+	"github.com/projectdiscovery/fastdialer/fastdialer/ja3"
 	"github.com/projectdiscovery/fastdialer/fastdialer/ja3/impersonate"
+	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/httpx/common/httputilz"
 	"github.com/projectdiscovery/networkpolicy"
 	"github.com/projectdiscovery/rawhttp"
@@ -140,12 +143,7 @@ func New(options *Options) (*HTTPX, error) {
 	}
 	transport := &http.Transport{
 		DialContext: httpx.Dialer.Dial,
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if options.TlsImpersonate {
-				return httpx.Dialer.DialTLSWithConfigImpersonate(ctx, network, addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS10}, impersonate.Random, nil)
-			}
-			return httpx.Dialer.DialTLS(ctx, network, addr)
-		},
+		DialTLSContext: httpx.buildTLSDialer(options),
 		MaxIdleConnsPerHost: -1,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -219,6 +217,40 @@ func New(options *Options) (*HTTPX, error) {
 	return httpx, nil
 }
 
+func (h *HTTPX) buildTLSDialer(options *Options) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if options.TlsImpersonate == "" {
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return h.Dialer.DialTLS(ctx, network, addr)
+		}
+	}
+
+	tlsCfg := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS10}
+
+	strategy, identity := resolveImpersonateStrategy(options.TlsImpersonate)
+
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return h.Dialer.DialTLSWithConfigImpersonate(ctx, network, addr, tlsCfg, strategy, identity)
+	}
+}
+
+func resolveImpersonateStrategy(value string) (impersonate.Strategy, *impersonate.Identity) {
+	switch strings.ToLower(value) {
+	case "", "chrome":
+		return impersonate.Chrome, nil
+	case "random":
+		// random JA3 mode was removed due to unsupported curve picks; keep chrome for compatibility.
+		return impersonate.Chrome, nil
+	default:
+		spec, err := ja3.ParseWithJa3(value)
+		if err != nil {
+			gologger.Warning().Msgf("invalid tls-impersonate value %q: %v; falling back to chrome", value, err)
+			return impersonate.Chrome, nil
+		}
+		identity := impersonate.Identity(*spec)
+		return impersonate.Custom, &identity
+	}
+}
+
 // Do http request
 func (h *HTTPX) Do(req *retryablehttp.Request, unsafeOptions UnsafeOptions) (*Response, error) {
 	timeStart := time.Now()
@@ -241,13 +273,22 @@ get_response:
 	resp.Input = req.Host
 
 	resp.Headers = httpresp.Header.Clone()
+	// body shouldn't be read with the following status codes
+	// 101 - Switching Protocols => websockets don't have a readable body
+	// 304 - Not Modified => no body the response terminates with latest header newline
+	shouldSkipBodyRead := generic.EqualsAny(httpresp.StatusCode, http.StatusSwitchingProtocols, http.StatusNotModified)
 
+	// the body is capped before dumping the response to avoid loading unbounded
+	// bodies (or infinite streams) in memory
+	bodyTruncated := h.Options.MaxResponseBodySizeToRead > 0 && httpresp.ContentLength > h.Options.MaxResponseBodySizeToRead
 	if h.Options.MaxResponseBodySizeToRead > 0 {
 		httpresp.Body = io.NopCloser(io.LimitReader(httpresp.Body, h.Options.MaxResponseBodySizeToRead))
-		defer func() {
-			_, _ = io.Copy(io.Discard, httpresp.Body)
-			_ = httpresp.Body.Close()
-		}()
+		if !shouldSkipBodyRead {
+			defer func() {
+				_, _ = io.Copy(io.Discard, httpresp.Body)
+				_ = httpresp.Body.Close()
+			}()
+		}
 	}
 
 	// httputil.DumpResponse does not handle websockets
@@ -256,6 +297,13 @@ get_response:
 		if stringsutil.ContainsAny(err.Error(), "tls: user canceled") {
 			shouldIgnoreErrors = true
 			shouldIgnoreBodyErrors = true
+		}
+
+		// Serializing a response whose body was capped fails with "ContentLength=x with
+		// Body length y", although headers and the truncated body are dumped correctly.
+		// An intentional truncation must not turn a valid response into a failed one.
+		if bodyTruncated && stringsutil.ContainsAny(err.Error(), "with Body length") {
+			shouldIgnoreErrors = true
 		}
 
 		// Edge case - some servers respond with gzip encoding header but uncompressed body, in this case the standard library configures the reader as gzip, triggering an error when read.
@@ -272,10 +320,7 @@ get_response:
 	resp.Raw = string(rawResp)
 	resp.RawHeaders = string(headers)
 	var respbody []byte
-	// body shouldn't be read with the following status codes
-	// 101 - Switching Protocols => websockets don't have a readable body
-	// 304 - Not Modified => no body the response terminates with latest header newline
-	if !generic.EqualsAny(httpresp.StatusCode, http.StatusSwitchingProtocols, http.StatusNotModified) {
+	if !shouldSkipBodyRead {
 		var err error
 		respbody, err = io.ReadAll(io.LimitReader(httpresp.Body, h.Options.MaxResponseBodySizeToRead))
 		if err != nil && !shouldIgnoreBodyErrors {
@@ -288,21 +333,19 @@ get_response:
 		return nil, closeErr
 	}
 
-	// Todo: replace with https://github.com/projectdiscovery/utils/issues/110
-	resp.RawData = make([]byte, len(respbody))
-	copy(resp.RawData, respbody)
+	// Keep a reference to the undecoded body. DecodeData returns the same slice
+	// when no transcoding is needed (the common case), so RawData and Data end up
+	// sharing the same backing array and we avoid an extra full-body copy. When
+	// DecodeData transcodes it returns a fresh slice, so RawData still holds the
+	// original undecoded bytes. Both fields are read-only afterwards, so sharing
+	// the backing array is safe.
+	rawbody := respbody
 
 	respbody, err = DecodeData(respbody, httpresp.Header)
 	if err != nil && !shouldIgnoreBodyErrors {
 		return nil, err
 	}
-
-	respbodystr := string(respbody)
-
-	// check if we need to strip html
-	if h.Options.VHostStripHTML {
-		respbodystr = h.htmlPolicy.Sanitize(respbodystr)
-	}
+	resp.RawData = rawbody
 
 	// if content length is not defined
 	if resp.ContentLength <= 0 {
@@ -323,11 +366,23 @@ get_response:
 
 	// fill metrics
 	resp.StatusCode = httpresp.StatusCode
-	if respbodystr != "" {
-		// number of words
-		resp.Words = len(strings.Split(respbodystr, " "))
-		// number of lines
-		resp.Lines = len(strings.Split(strings.TrimSpace(respbodystr), "\n"))
+
+	// Word/line counts are computed directly over the body bytes to avoid
+	// materializing an extra full-body string copy (and the slice produced by
+	// strings.Split) on the hot path. When HTML stripping is enabled the
+	// sanitized string is required, so counts are derived from it to preserve the
+	// previous behavior.
+	if h.Options.VHostStripHTML {
+		respbodystr := h.htmlPolicy.Sanitize(string(respbody))
+		if respbodystr != "" {
+			resp.Words = len(strings.Split(respbodystr, " "))
+			resp.Lines = len(strings.Split(strings.TrimSpace(respbodystr), "\n"))
+		}
+	} else if len(respbody) > 0 {
+		// equivalent to len(strings.Split(string(respbody), " ")) and
+		// len(strings.Split(strings.TrimSpace(string(respbody)), "\n"))
+		resp.Words = bytes.Count(respbody, []byte{' '}) + 1
+		resp.Lines = bytes.Count(bytes.TrimSpace(respbody), []byte{'\n'}) + 1
 	}
 
 	if !h.Options.Unsafe && h.Options.TLSGrab {
